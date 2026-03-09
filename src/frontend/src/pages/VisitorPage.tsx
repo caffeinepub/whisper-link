@@ -15,7 +15,7 @@ import { getBackend } from "../utils/getBackend";
 
 // --- Intro sequence words ---
 const introWords = [
-  "Hey…",
+  "Hey\u2026",
   "I've",
   "been",
   "waiting",
@@ -23,7 +23,7 @@ const introWords = [
   "hear",
   "your",
   "voice",
-  "❤️",
+  "\u2764\uFE0F",
 ];
 
 function formatTimestamp(ts: bigint): string {
@@ -103,8 +103,8 @@ export default function VisitorPage() {
   const [showCTA, setShowCTA] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
-  const [isMicActive, setIsMicActive] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [micError, setMicError] = useState<string | null>(null);
   const [isAdminTyping, setIsAdminTyping] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -113,9 +113,12 @@ export default function VisitorPage() {
 
   const { messages, isLoading, sendMessage } = useMessages(2000);
   const sessionState = useSessionState(3000);
-  const { isConnected: _isVoiceConnected } = useWebRTC({
+
+  // Pass the captured stream so WebRTC doesn't re-request mic permission
+  useWebRTC({
     role: "visitor",
     enabled: stage === "connected",
+    existingStream: micStream,
   });
 
   // Intro animation: reveal words
@@ -165,7 +168,7 @@ export default function VisitorPage() {
     return () => clearInterval(interval);
   }, [stage]);
 
-  // Auto-scroll chat - intentionally triggers on messages/typing changes
+  // Auto-scroll chat
   // biome-ignore lint/correctness/useExhaustiveDependencies: scrolling on data change
   useEffect(() => {
     if (scrollRef.current) {
@@ -186,6 +189,7 @@ export default function VisitorPage() {
   }, []);
 
   const requestMicPermission = useCallback(async () => {
+    setMicError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -194,17 +198,22 @@ export default function VisitorPage() {
           autoGainControl: true,
         },
       });
+      // Store the captured stream — WebRTC hook will reuse it, not request again
       setMicStream(stream);
-      setIsMicActive(true);
-      const b = await getBackend();
-      await b.setVisitorOnline(true);
-      setStage("connected");
-    } catch {
-      // Still allow connection without mic
-      const b = await getBackend();
-      await b.setVisitorOnline(true);
-      setStage("connected");
+    } catch (err) {
+      // Mic denied or unavailable — still allow chat-only mode
+      const msg = err instanceof Error ? err.message : "Microphone unavailable";
+      setMicError(msg);
+      console.warn("Mic permission denied, continuing in chat-only mode:", msg);
     }
+    // Always proceed to connected stage regardless of mic outcome
+    try {
+      const b = await getBackend();
+      await b.setVisitorOnline(true);
+    } catch {
+      // ignore backend errors during transition
+    }
+    setStage("connected");
   }, []);
 
   const handleSend = useCallback(async () => {
@@ -229,6 +238,8 @@ export default function VisitorPage() {
       setIsMuted((prev) => !prev);
     }
   }, [micStream]);
+
+  const isMicActive = !!micStream && !isMuted;
 
   return (
     <div className="relative min-h-screen overflow-hidden visitor-bg animate-gradient-shift">
@@ -286,7 +297,7 @@ export default function VisitorPage() {
                     className="font-body text-base sm:text-lg text-center"
                     style={{ color: "oklch(0.85 0.08 330)" }}
                   >
-                    Let me hear your voice…
+                    Let me hear your voice\u2026
                   </p>
                   <Button
                     data-ocid="visitor.primary_button"
@@ -303,6 +314,15 @@ export default function VisitorPage() {
                     <Mic className="mr-2 h-5 w-5" />
                     Allow Microphone
                   </Button>
+
+                  {micError && (
+                    <p
+                      className="text-xs text-center mt-1"
+                      style={{ color: "oklch(0.75 0.15 30)" }}
+                    >
+                      Mic unavailable \u2014 you can still chat
+                    </p>
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>
@@ -337,7 +357,9 @@ export default function VisitorPage() {
                 }}
               >
                 <div
-                  className={`w-2 h-2 rounded-full ${sessionState.adminOnline ? "bg-green-400" : "bg-yellow-400"}`}
+                  className={`w-2 h-2 rounded-full ${
+                    sessionState.adminOnline ? "bg-green-400" : "bg-yellow-400"
+                  }`}
                   style={{
                     boxShadow: sessionState.adminOnline
                       ? "0 0 8px 2px oklch(0.75 0.25 150 / 0.7)"
@@ -346,8 +368,8 @@ export default function VisitorPage() {
                 />
                 <span style={{ color: "oklch(0.88 0.05 330)" }}>
                   {sessionState.adminOnline
-                    ? "Connected ❤️"
-                    : "Waiting for connection…"}
+                    ? "Connected \u2764\uFE0F"
+                    : "Waiting for connection\u2026"}
                 </span>
               </div>
             </motion.div>
@@ -406,7 +428,7 @@ export default function VisitorPage() {
                       className="text-sm text-center"
                       style={{ color: "oklch(0.65 0.08 330)" }}
                     >
-                      Your conversation will appear here…
+                      Your conversation will appear here\u2026
                     </p>
                   </div>
                 )}
@@ -428,7 +450,7 @@ export default function VisitorPage() {
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="Write a message…"
+                  placeholder="Write a message\u2026"
                   className="flex-1 rounded-full border-0 text-sm"
                   style={{
                     background: "oklch(0.25 0.07 315 / 0.6)",
@@ -469,86 +491,103 @@ export default function VisitorPage() {
               {micStream && (
                 <VoiceVisualizer
                   stream={micStream}
-                  isActive={isMicActive && !isMuted}
+                  isActive={isMicActive}
                   variant="visitor"
                 />
               )}
 
-              {/* Mic button */}
-              <div className="relative">
-                {/* Ripple rings */}
-                {isMicActive && !isMuted && (
-                  <>
-                    <div
-                      className="absolute inset-0 rounded-full animate-ripple"
-                      style={{ background: "oklch(0.72 0.22 350 / 0.2)" }}
-                    />
-                    <div
-                      className="absolute inset-0 rounded-full animate-ripple"
-                      style={{
-                        background: "oklch(0.72 0.22 350 / 0.15)",
-                        animationDelay: "0.5s",
-                      }}
-                    />
-                  </>
-                )}
-                <button
-                  type="button"
-                  data-ocid="mic.button"
-                  onClick={toggleMic}
-                  className="relative w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300"
+              {/* Mic button — only show if mic is available */}
+              {micStream ? (
+                <div className="relative">
+                  {/* Ripple rings */}
+                  {isMicActive && (
+                    <>
+                      <div
+                        className="absolute inset-0 rounded-full animate-ripple"
+                        style={{ background: "oklch(0.72 0.22 350 / 0.2)" }}
+                      />
+                      <div
+                        className="absolute inset-0 rounded-full animate-ripple"
+                        style={{
+                          background: "oklch(0.72 0.22 350 / 0.15)",
+                          animationDelay: "0.5s",
+                        }}
+                      />
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    data-ocid="mic.button"
+                    onClick={toggleMic}
+                    className="relative w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300"
+                    style={{
+                      background: isMuted
+                        ? "oklch(0.22 0.05 310 / 0.8)"
+                        : "linear-gradient(135deg, oklch(0.68 0.22 350) 0%, oklch(0.58 0.22 320) 100%)",
+                      boxShadow:
+                        !isMuted && isMicActive
+                          ? "0 0 30px oklch(0.70 0.22 350 / 0.6), 0 0 60px oklch(0.60 0.20 320 / 0.3)"
+                          : "0 4px 20px oklch(0.10 0.04 330 / 0.5)",
+                      border: "2px solid oklch(0.75 0.18 350 / 0.3)",
+                    }}
+                  >
+                    {isMuted ? (
+                      <MicOff
+                        className="w-7 h-7"
+                        style={{ color: "oklch(0.70 0.08 330)" }}
+                      />
+                    ) : (
+                      <Mic
+                        className="w-7 h-7"
+                        style={{ color: "oklch(0.98 0.01 0)" }}
+                      />
+                    )}
+                  </button>
+                </div>
+              ) : (
+                // Chat-only mode indicator
+                <div
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs"
                   style={{
-                    background: isMuted
-                      ? "oklch(0.22 0.05 310 / 0.8)"
-                      : "linear-gradient(135deg, oklch(0.68 0.22 350) 0%, oklch(0.58 0.22 320) 100%)",
-                    boxShadow:
-                      !isMuted && isMicActive
-                        ? "0 0 30px oklch(0.70 0.22 350 / 0.6), 0 0 60px oklch(0.60 0.20 320 / 0.3)"
-                        : "0 4px 20px oklch(0.10 0.04 330 / 0.5)",
-                    border: "2px solid oklch(0.75 0.18 350 / 0.3)",
+                    background: "oklch(0.20 0.05 310 / 0.5)",
+                    border: "1px solid oklch(0.38 0.08 320 / 0.3)",
+                    color: "oklch(0.65 0.06 330)",
                   }}
                 >
-                  {isMuted ? (
-                    <MicOff
-                      className="w-7 h-7"
-                      style={{ color: "oklch(0.70 0.08 330)" }}
-                    />
-                  ) : (
-                    <Mic
-                      className="w-7 h-7"
-                      style={{ color: "oklch(0.98 0.01 0)" }}
-                    />
-                  )}
-                </button>
-              </div>
+                  <MicOff className="w-3.5 h-3.5" />
+                  Chat mode
+                </div>
+              )}
 
               {/* Mute toggle label */}
-              <button
-                type="button"
-                data-ocid="visitor.toggle"
-                onClick={toggleMic}
-                className="text-xs transition-colors duration-200"
-                style={{ color: "oklch(0.65 0.08 330)" }}
-              >
-                {isMuted
-                  ? "Tap to unmute"
-                  : isMicActive
-                    ? "Listening…"
-                    : "Tap to speak"}
-              </button>
+              {micStream && (
+                <button
+                  type="button"
+                  data-ocid="visitor.toggle"
+                  onClick={toggleMic}
+                  className="text-xs transition-colors duration-200"
+                  style={{ color: "oklch(0.65 0.08 330)" }}
+                >
+                  {isMuted
+                    ? "Tap to unmute"
+                    : isMicActive
+                      ? "Listening\u2026"
+                      : "Tap to speak"}
+                </button>
+              )}
             </motion.div>
 
             {/* Footer */}
             <footer className="mt-6 text-center">
               <p className="text-xs" style={{ color: "oklch(0.45 0.05 310)" }}>
-                © {new Date().getFullYear()}.{" "}
+                \u00A9 {new Date().getFullYear()}.{" "}
                 <a
                   href={`https://caffeine.ai?utm_source=caffeine-footer&utm_medium=referral&utm_content=${encodeURIComponent(window.location.hostname)}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hover:opacity-70 transition-opacity"
                 >
-                  Built with ❤️ using caffeine.ai
+                  Built with \u2764\uFE0F using caffeine.ai
                 </a>
               </p>
             </footer>

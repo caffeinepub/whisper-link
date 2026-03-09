@@ -4,6 +4,8 @@ import { getBackend } from "../utils/getBackend";
 interface UseWebRTCOptions {
   role: "visitor" | "admin";
   enabled?: boolean;
+  /** Pre-captured stream to use instead of requesting getUserMedia again */
+  existingStream?: MediaStream | null;
 }
 
 interface WebRTCState {
@@ -15,7 +17,11 @@ interface WebRTCState {
   error: string | null;
 }
 
-export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
+export function useWebRTC({
+  role,
+  enabled = false,
+  existingStream,
+}: UseWebRTCOptions) {
   const [state, setState] = useState<WebRTCState>({
     isConnected: false,
     isConnecting: false,
@@ -31,6 +37,8 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
   const signalSinceRef = useRef<bigint>(BigInt(0));
   const signalIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mountedRef = useRef(true);
+  // Track if we already processed an offer to avoid duplicate handling
+  const offerProcessedRef = useRef(false);
 
   const createPeerConnection = useCallback(() => {
     if (pcRef.current) {
@@ -93,27 +101,41 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
     return pc;
   }, [role]);
 
-  const startLocalStream =
-    useCallback(async (): Promise<MediaStream | null> => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video: false,
-        });
-        localStreamRef.current = stream;
-        setState((prev) => ({ ...prev, localStream: stream }));
-        return stream;
-      } catch (err) {
-        const errorMsg =
-          err instanceof Error ? err.message : "Microphone access denied";
-        setState((prev) => ({ ...prev, error: errorMsg }));
-        return null;
-      }
-    }, []);
+  /**
+   * Get a local audio stream. Prefers the existingStream passed in props
+   * to avoid prompting the user twice.
+   */
+  const getLocalStream = useCallback(async (): Promise<MediaStream | null> => {
+    // Use pre-captured stream if available
+    if (existingStream?.active) {
+      localStreamRef.current = existingStream;
+      setState((prev) => ({ ...prev, localStream: existingStream }));
+      return existingStream;
+    }
+    // Re-use already captured stream
+    if (localStreamRef.current?.active) {
+      return localStreamRef.current;
+    }
+    // Fall back to requesting a new stream
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      localStreamRef.current = stream;
+      setState((prev) => ({ ...prev, localStream: stream }));
+      return stream;
+    } catch (err) {
+      const errorMsg =
+        err instanceof Error ? err.message : "Microphone access denied";
+      setState((prev) => ({ ...prev, error: errorMsg }));
+      return null;
+    }
+  }, [existingStream]);
 
   const startSignalPolling = useCallback(() => {
     if (signalIntervalRef.current) clearInterval(signalIntervalRef.current);
@@ -123,9 +145,6 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
         const b = await getBackend();
         const signals = await b.getSignals(role, signalSinceRef.current);
         if (signals.length > 0) {
-          if (role === "visitor" && !pcRef.current) {
-            createPeerConnection();
-          }
           for (const signal of signals) {
             try {
               await processSignal(signal.payload);
@@ -142,7 +161,7 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
       }
     }, 1500);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [role, createPeerConnection]);
+  }, [role]);
 
   const processSignal = useCallback(
     async (payload: string) => {
@@ -153,34 +172,67 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
         return;
       }
 
-      if (!pcRef.current) return;
-
       if (data.type === "offer" && role === "visitor") {
-        const stream = await startLocalStream();
-        if (!stream) return;
-        for (const track of stream.getTracks()) {
-          pcRef.current!.addTrack(track, stream);
+        // Avoid processing the same offer multiple times
+        if (offerProcessedRef.current) return;
+
+        // Create peer connection if it doesn't exist
+        const pc = pcRef.current ?? createPeerConnection();
+
+        const stream = await getLocalStream();
+        if (!stream) {
+          console.warn("No local stream available for WebRTC offer");
+          // Still try to answer without audio track
         }
 
-        await pcRef.current.setRemoteDescription(
-          new RTCSessionDescription({ type: "offer", sdp: data.sdp }),
-        );
-        const answer = await pcRef.current.createAnswer();
-        await pcRef.current.setLocalDescription(answer);
+        try {
+          if (stream) {
+            for (const track of stream.getTracks()) {
+              // Avoid adding duplicate tracks
+              const senders = pc.getSenders();
+              const alreadyAdded = senders.some(
+                (s) => s.track?.id === track.id,
+              );
+              if (!alreadyAdded) {
+                pc.addTrack(track, stream);
+              }
+            }
+          }
 
-        const b = await getBackend();
-        await b.postSignal(
-          "admin",
-          JSON.stringify({ type: "answer", sdp: answer.sdp }),
-        );
-        setState((prev) => ({ ...prev, isConnecting: true }));
+          if (pc.signalingState !== "stable") {
+            console.warn(
+              "PC not in stable state, skipping offer",
+              pc.signalingState,
+            );
+            return;
+          }
+
+          await pc.setRemoteDescription(
+            new RTCSessionDescription({ type: "offer", sdp: data.sdp }),
+          );
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          const b = await getBackend();
+          await b.postSignal(
+            "admin",
+            JSON.stringify({ type: "answer", sdp: answer.sdp }),
+          );
+          offerProcessedRef.current = true;
+          setState((prev) => ({ ...prev, isConnecting: true }));
+        } catch (err) {
+          console.error("Error processing offer:", err);
+          offerProcessedRef.current = false;
+        }
       } else if (data.type === "answer" && role === "admin") {
+        if (!pcRef.current) return;
         if (pcRef.current.signalingState === "have-local-offer") {
           await pcRef.current.setRemoteDescription(
             new RTCSessionDescription({ type: "answer", sdp: data.sdp }),
           );
         }
       } else if (data.type === "ice" && data.candidate) {
+        if (!pcRef.current) return;
         try {
           if (
             pcRef.current.remoteDescription &&
@@ -195,7 +247,8 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
         }
       }
     },
-    [role, startLocalStream],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [role, getLocalStream, createPeerConnection],
   );
 
   // Admin: start a voice session (create offer)
@@ -203,7 +256,7 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
     if (role !== "admin") return;
     setState((prev) => ({ ...prev, isConnecting: true, error: null }));
 
-    const stream = await startLocalStream();
+    const stream = await getLocalStream();
     if (!stream) {
       setState((prev) => ({ ...prev, isConnecting: false }));
       return;
@@ -233,30 +286,32 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
         error: "Failed to start voice session",
       }));
     }
-  }, [role, createPeerConnection, startLocalStream, startSignalPolling]);
+  }, [role, createPeerConnection, getLocalStream, startSignalPolling]);
 
-  // Visitor: passively listen for signals
+  // Visitor: passively listen for signals once enabled
+  // biome-ignore lint/correctness/useExhaustiveDependencies: only re-run when enabled toggles; createPeerConnection/startSignalPolling/role are stable for the lifetime of the visitor role
   useEffect(() => {
-    if (role === "visitor" && enabled) {
-      mountedRef.current = true;
-      createPeerConnection();
-      startSignalPolling();
-    }
+    if (role !== "visitor" || !enabled) return;
+    mountedRef.current = true;
+    offerProcessedRef.current = false;
+    createPeerConnection();
+    startSignalPolling();
     return () => {
       mountedRef.current = false;
       if (signalIntervalRef.current) clearInterval(signalIntervalRef.current);
     };
-  }, [role, enabled, createPeerConnection, startSignalPolling]);
+  }, [enabled]);
 
   const toggleMute = useCallback(() => {
-    if (localStreamRef.current) {
-      const audioTracks = localStreamRef.current.getAudioTracks();
+    const stream = localStreamRef.current ?? existingStream;
+    if (stream) {
+      const audioTracks = stream.getAudioTracks();
       for (const track of audioTracks) {
         track.enabled = !track.enabled;
       }
       setState((prev) => ({ ...prev, isMuted: !prev.isMuted }));
     }
-  }, []);
+  }, [existingStream]);
 
   const endSession = useCallback(async () => {
     if (signalIntervalRef.current) clearInterval(signalIntervalRef.current);
@@ -271,6 +326,7 @@ export function useWebRTC({ role, enabled = false }: UseWebRTCOptions) {
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
     }
+    offerProcessedRef.current = false;
     setState({
       isConnected: false,
       isConnecting: false,
